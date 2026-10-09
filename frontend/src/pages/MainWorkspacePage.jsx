@@ -1,0 +1,679 @@
+import React, { useState } from "react";
+import VideoPlayer from "../VideoPlayer.jsx";
+import ProgressDisplay from "../ProgressDisplay.jsx";
+import CorrectionWorkflow from "../CorrectionWorkflow.jsx";
+import Frame0Preview from "../Frame0Preview.jsx";
+import {
+  trackFrames,
+  commitFrames,
+  getProgress,
+  getTrackedVideoUrl,
+  getGoldenVideoUrl,
+  getSourceVideoUrl,
+  downloadGolden,
+  rebuildGoldenPreview,
+  getBehavior,
+} from "../api.js";
+import BehaviorLabelsReference from "../BehaviorLabelsReference.jsx";
+import BehaviorTimeline from "../BehaviorTimeline.jsx";
+import { ANNOTATION_MODES } from "../behaviorLabels.js";
+
+function GoldenPreviewSyncStatus({ inSync, rebuilding }) {
+  if (rebuilding) {
+    return (
+      <span
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 8,
+          fontSize: 13,
+          fontWeight: 600,
+          color: "#055160",
+        }}
+      >
+        <span
+          style={{
+            width: 10,
+            height: 10,
+            borderRadius: "50%",
+            backgroundColor: "#0dcaf0",
+            boxShadow: "0 0 0 2px rgba(13, 202, 240, 0.35)",
+          }}
+        />
+        Rebuilding preview…
+      </span>
+    );
+  }
+
+  if (inSync) {
+    return (
+      <span
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 8,
+          fontSize: 13,
+          fontWeight: 600,
+          color: "#155724",
+        }}
+      >
+        <span
+          style={{
+            width: 10,
+            height: 10,
+            borderRadius: "50%",
+            backgroundColor: "#28a745",
+            boxShadow: "0 0 0 2px rgba(40, 167, 69, 0.35)",
+          }}
+        />
+        Preview in sync with labels
+      </span>
+    );
+  }
+
+  return (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 8,
+        fontSize: 13,
+        fontWeight: 600,
+        color: "#842029",
+      }}
+    >
+      <span
+        style={{
+          width: 10,
+          height: 10,
+          borderRadius: "50%",
+          backgroundColor: "#dc3545",
+          boxShadow: "0 0 0 2px rgba(220, 53, 69, 0.35)",
+        }}
+      />
+      Preview out of sync — rebuild required
+    </span>
+  );
+}
+
+export default function MainWorkspacePage({ runId, frame0Image, annotationMode, onProgressUpdate }) {
+  const isBehaviorMode = annotationMode === ANNOTATION_MODES.BEHAVIOR;
+  const [activeTab, setActiveTab] = useState("tracking");
+  const [nFramesInput, setNFramesInput] = useState("50");
+  const [autoResetInterval, setAutoResetInterval] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+  const [trackedVideoUrl, setTrackedVideoUrl] = useState(null);
+  const [goldenVideoUrl, setGoldenVideoUrl] = useState(null);
+  const [sourceVideoUrl, setSourceVideoUrl] = useState(null);
+  const [goldenPlaybackFrame, setGoldenPlaybackFrame] = useState(0);
+  const [goldenPreviewInSync, setGoldenPreviewInSync] = useState(true);
+  const [rebuildingPreview, setRebuildingPreview] = useState(false);
+  const [behaviorTimelineRefresh, setBehaviorTimelineRefresh] = useState(0);
+  const goldenVideoRef = React.useRef(null);
+  const sourceVideoRef = React.useRef(null);
+  const [trackProgress, setTrackProgress] = useState(0);
+  const [trackMessage, setTrackMessage] = useState("");
+  const [isTracking, setIsTracking] = useState(false);
+  const [progress, setProgress] = useState({
+    processed: null,
+    total: null,
+    percent: 0,
+    fps: null,
+    lastChunkSeedIdx: null,
+    goldenMaxIdx: null,
+  });
+
+  const loadBehaviorSyncStatus = React.useCallback(async () => {
+    if (!runId || !isBehaviorMode) return;
+    try {
+      const data = await getBehavior(runId);
+      setGoldenPreviewInSync(data.preview_in_sync !== false);
+    } catch (e) {
+      console.error("Failed to load behaviour sync status:", e);
+    }
+  }, [runId, isBehaviorMode]);
+
+  React.useEffect(() => {
+    if (runId) {
+      loadProgress();
+      loadBehaviorSyncStatus();
+    }
+  }, [runId]);
+
+  React.useEffect(() => {
+    if (runId && isBehaviorMode) {
+      setSourceVideoUrl(getSourceVideoUrl(runId));
+    }
+  }, [runId, isBehaviorMode]);
+
+  React.useEffect(() => {
+    loadBehaviorSyncStatus();
+  }, [loadBehaviorSyncStatus, isBehaviorMode]);
+
+  const loadProgress = async () => {
+    try {
+      const prog = await getProgress(runId);
+      setProgress({
+        processed: prog.golden_processed,
+        total: prog.total_frames,
+        percent: prog.golden_percent || 0,
+        fps: prog.fps || null,
+        lastChunkSeedIdx: prog.last_chunk_seed_idx || null,
+        goldenMaxIdx: prog.golden_max_idx !== null && prog.golden_max_idx !== undefined ? prog.golden_max_idx : null,
+      });
+      if (prog.golden_processed > 0) {
+        setGoldenVideoUrl(getGoldenVideoUrl(runId) + `?t=${Date.now()}`);
+      }
+      if (onProgressUpdate) {
+        onProgressUpdate(prog);
+      }
+    } catch (e) {
+      console.error("Failed to load progress:", e);
+    }
+  };
+
+  const handleTrack = async () => {
+    setError("");
+    setSuccess("");
+
+    const nFramesTrimmed = nFramesInput.trim();
+    if (nFramesTrimmed === "") {
+      setError("Please enter how many new frames to track.");
+      return;
+    }
+    const nFrames = parseInt(nFramesTrimmed, 10);
+    if (isNaN(nFrames) || nFrames < 1) {
+      setError("N new frames to track must be a positive number.");
+      return;
+    }
+    if (nFrames > 5000) {
+      setError("N new frames to track must be at most 5000.");
+      return;
+    }
+
+    setBusy(true);
+    setIsTracking(true);
+    setTrackProgress(0);
+    setTrackMessage("Preparing to track...");
+
+    try {
+      const resetVal = autoResetInterval.trim() !== "" ? parseInt(autoResetInterval, 10) : null;
+      if (resetVal !== null && (isNaN(resetVal) || resetVal < 1)) {
+        throw new Error("Auto-reset interval must be a positive number");
+      }
+
+      await trackFrames(runId, nFrames, resetVal, (progressVal, message) => {
+        setTrackProgress(progressVal);
+        setTrackMessage(message || "");
+      });
+      await loadProgress();
+      setTimeout(() => {
+        setTrackedVideoUrl(getTrackedVideoUrl(runId) + `?t=${Date.now()}`);
+      }, 500);
+      setTrackProgress(100);
+      setTrackMessage("Completed");
+      setTimeout(() => {
+        setTrackProgress(0);
+        setTrackMessage("");
+        setIsTracking(false);
+      }, 2000);
+    } catch (e) {
+      setError(`Failed to track: ${e.message}`);
+      setTrackProgress(0);
+      setTrackMessage("");
+      setIsTracking(false);
+    } finally {
+      setBusy(false);
+      setIsTracking(false);
+    }
+  };
+
+  const handleCommit = async () => {
+    setBusy(true);
+    setIsTracking(false);
+    setError("");
+    setSuccess("");
+    setTrackProgress(0);
+    setTrackMessage("");
+
+    try {
+      await commitFrames(runId);
+      await loadProgress();
+      setGoldenVideoUrl(getGoldenVideoUrl(runId) + `?t=${Date.now()}`);
+      if (isBehaviorMode) {
+        setGoldenPreviewInSync(false);
+      }
+      setSuccess(`✅ Committed! Progress: ${progress.processed}/${progress.total} frames`);
+    } catch (e) {
+      setError(`Failed to commit: ${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const refreshGoldenVideo = () => {
+    if (runId) {
+      setGoldenVideoUrl(getGoldenVideoUrl(runId) + `?t=${Date.now()}`);
+    }
+  };
+
+  const handleBehaviorLabelChanged = (_dimension, previewInSync) => {
+    setBehaviorTimelineRefresh((n) => n + 1);
+    if (previewInSync === false) {
+      setGoldenPreviewInSync(false);
+    }
+  };
+
+  const handleTimelineSeek = (frame) => {
+    setGoldenPlaybackFrame(frame);
+    goldenVideoRef.current?.seekToFrame(frame);
+    sourceVideoRef.current?.seekToFrame(frame);
+  };
+
+  const handleRebuildGoldenPreview = async () => {
+    if (!runId) return;
+    setRebuildingPreview(true);
+    setError("");
+    setSuccess("");
+    try {
+      await rebuildGoldenPreview(runId);
+      refreshGoldenVideo();
+      setGoldenPreviewInSync(true);
+      setBehaviorTimelineRefresh((n) => n + 1);
+      setSuccess("Golden preview rebuilt and is in sync with behaviour labels.");
+    } catch (e) {
+      setError(`Failed to rebuild golden preview: ${e.message}`);
+    } finally {
+      setRebuildingPreview(false);
+    }
+  };
+
+  const handleDownloadGolden = async () => {
+    setBusy(true);
+    setError("");
+    setSuccess("");
+
+    try {
+      await downloadGolden(runId);
+      setSuccess("✅ Golden download started (check your browser downloads).");
+    } catch (e) {
+      setError(`Failed to download golden folder: ${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const tabs = [
+    { id: "tracking", label: "📹 Tracking", icon: "📹" },
+    { id: "golden", label: "⭐ Golden", icon: "⭐" },
+    { id: "init", label: "🔍 Initialization", icon: "🔍" },
+  ];
+
+  return (
+    <div style={{ maxWidth: 1400, margin: "0 auto", padding: 24 }}>
+      <h1 style={{ marginTop: 0, marginBottom: 32 }}>JISTBA</h1>
+
+      <div
+        style={{
+          padding: 16,
+          backgroundColor: "#e7f3ff",
+          borderRadius: 8,
+          marginBottom: 24,
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+        }}
+      >
+        <div>
+          <strong>Run ID:</strong> <code>{runId}</code>
+          {isBehaviorMode && (
+            <span
+              style={{
+                marginLeft: 12,
+                padding: "2px 10px",
+                borderRadius: 999,
+                backgroundColor: "#fff3cd",
+                color: "#856404",
+                fontSize: 12,
+                fontWeight: 600,
+              }}
+            >
+              Behaviour mode
+            </span>
+          )}
+        </div>
+        <div>
+          <strong>FPS:</strong> {progress.fps || "N/A"} | <strong>Total Frames:</strong> {progress.total || "N/A"}
+        </div>
+      </div>
+
+      <div style={{ marginBottom: 24, borderBottom: "2px solid #dee2e6" }}>
+        <div style={{ display: "flex", gap: 8 }}>
+          {tabs.map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              style={{
+                padding: "12px 24px",
+                fontSize: 14,
+                fontWeight: 600,
+                backgroundColor: activeTab === tab.id ? "#007bff" : "transparent",
+                color: activeTab === tab.id ? "white" : "#495057",
+                border: "none",
+                borderBottom: activeTab === tab.id ? "3px solid #0056b3" : "3px solid transparent",
+                cursor: "pointer",
+                borderRadius: "8px 8px 0 0",
+                transition: "all 0.2s",
+              }}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {error && (
+        <div
+          style={{
+            padding: 12,
+            marginBottom: 16,
+            backgroundColor: "#f8d7da",
+            border: "1px solid #f5c6cb",
+            borderRadius: 6,
+            color: "#721c24",
+          }}
+        >
+          {error}
+        </div>
+      )}
+      {success && (
+        <div
+          style={{
+            padding: 12,
+            marginBottom: 16,
+            backgroundColor: "#d4edda",
+            border: "1px solid #c3e6cb",
+            borderRadius: 6,
+            color: "#155724",
+          }}
+        >
+          {success}
+        </div>
+      )}
+
+      <div
+        style={{
+          backgroundColor: "#fff",
+          border: "1px solid #dee2e6",
+          borderRadius: 12,
+          padding: 32,
+          boxShadow: "0 2px 4px rgba(0,0,0,0.1)",
+        }}
+      >
+        {activeTab === "tracking" && (
+          <div>
+            <h2 style={{ marginTop: 0, marginBottom: 24 }}>Tracking</h2>
+
+            <div style={{ marginBottom: 24, padding: 16, backgroundColor: "#f8f9fa", borderRadius: 8 }}>
+              <ProgressDisplay processed={progress.processed} total={progress.total} percent={progress.percent} />
+            </div>
+
+            <div style={{ marginBottom: 24, padding: 16, backgroundColor: "#f8f9fa", borderRadius: 8 }}>
+              <h3 style={{ marginTop: 0 }}>Track New Frames</h3>
+
+              <div style={{ display: "flex", gap: 12, alignItems: "flex-end", flexWrap: "wrap", marginBottom: 16 }}>
+                <div>
+                  <label style={{ display: "block", marginBottom: 4, fontSize: 14, fontWeight: 500 }}>
+                    N new frames to track:
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="5000"
+                    value={nFramesInput}
+                    onChange={(e) => setNFramesInput(e.target.value)}
+                    disabled={busy}
+                    style={{
+                      width: 120,
+                      padding: 8,
+                      border: "1px solid #ccc",
+                      borderRadius: 4,
+                      fontSize: 14,
+                    }}
+                  />
+                </div>
+                <div>
+                  <label style={{ display: "block", marginBottom: 4, fontSize: 14, fontWeight: 500 }}>
+                    Auto-reset interval (optional):
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    value={autoResetInterval}
+                    onChange={(e) => setAutoResetInterval(e.target.value)}
+                    disabled={busy}
+                    placeholder="e.g., 10"
+                    style={{
+                      width: 120,
+                      padding: 8,
+                      border: "1px solid #ccc",
+                      borderRadius: 4,
+                      fontSize: 14,
+                    }}
+                  />
+                </div>
+                <button
+                  onClick={handleTrack}
+                  disabled={busy || !runId}
+                  style={{
+                    padding: "8px 16px",
+                    fontSize: 14,
+                    fontWeight: 500,
+                    backgroundColor: busy ? "#ccc" : "#007bff",
+                    color: "white",
+                    border: "none",
+                    borderRadius: 4,
+                    cursor: busy ? "not-allowed" : "pointer",
+                  }}
+                >
+                  {busy ? "Tracking..." : "Track + render chunk"}
+                </button>
+                <button
+                  onClick={handleCommit}
+                  disabled={busy || !runId}
+                  style={{
+                    padding: "8px 16px",
+                    fontSize: 14,
+                    fontWeight: 500,
+                    backgroundColor: busy ? "#ccc" : "#28a745",
+                    color: "white",
+                    border: "none",
+                    borderRadius: 4,
+                    cursor: busy ? "not-allowed" : "pointer",
+                  }}
+                >
+                  {busy ? "Committing..." : "✅ Commit chunk to golden"}
+                </button>
+              </div>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 24 }}>
+              <div>
+                <VideoPlayer
+                  videoUrl={trackedVideoUrl}
+                  label="Tracked chunk preview (current)"
+                  height={480}
+                  progress={isTracking ? trackProgress : null}
+                  progressMessage={isTracking ? trackMessage : null}
+                />
+              </div>
+              <div>
+                <VideoPlayer
+                  videoUrl={goldenVideoUrl}
+                  label="Golden preview (committed so far)"
+                  height={480}
+                />
+              </div>
+            </div>
+
+            {isBehaviorMode && (
+              <p
+                style={{
+                  marginTop: 16,
+                  fontSize: 13,
+                  color: "#6c757d",
+                  lineHeight: 1.5,
+                  padding: "12px 14px",
+                  backgroundColor: "#f8f9fa",
+                  borderRadius: 8,
+                  border: "1px solid #e9ecef",
+                }}
+              >
+                Behaviour labels are edited on the <strong>Golden</strong> tab after you finish tracking and
+                committing masks.
+              </p>
+            )}
+
+            <div style={{ marginTop: 48, paddingTop: 32, borderTop: "2px solid #dee2e6" }}>
+              <h2 style={{ marginTop: 0, marginBottom: 24 }}>Corrections</h2>
+              {runId && progress.fps !== null && (
+                <CorrectionWorkflow
+                  runId={runId}
+                  trackedVideoUrl={trackedVideoUrl}
+                  fps={progress.fps}
+                  seedIdx={
+                    progress.lastChunkSeedIdx !== null
+                      ? progress.lastChunkSeedIdx
+                      : progress.goldenMaxIdx !== null
+                        ? progress.goldenMaxIdx
+                        : 0
+                  }
+                  onCorrectionApplied={() => {
+                    loadProgress();
+                    if (isBehaviorMode) {
+                      setBehaviorTimelineRefresh((t) => t + 1);
+                    }
+                  }}
+                />
+              )}
+            </div>
+          </div>
+        )}
+
+        {activeTab === "golden" && (
+          <div>
+            <h2 style={{ marginTop: 0, marginBottom: 24 }}>Golden Preview</h2>
+
+            {isBehaviorMode && goldenVideoUrl && (
+              <div style={{ marginBottom: 12 }}>
+                <GoldenPreviewSyncStatus inSync={goldenPreviewInSync} rebuilding={rebuildingPreview} />
+              </div>
+            )}
+
+            {isBehaviorMode && sourceVideoUrl && (
+              <div style={{ marginBottom: 24 }}>
+                <VideoPlayer
+                  ref={sourceVideoRef}
+                  videoUrl={sourceVideoUrl}
+                  label="Source video (no masks or labels)"
+                  height={480}
+                  fps={progress.fps}
+                  onPlaybackFrame={setGoldenPlaybackFrame}
+                />
+              </div>
+            )}
+
+            <div style={{ marginBottom: 24 }}>
+              <VideoPlayer
+                ref={isBehaviorMode ? goldenVideoRef : null}
+                videoUrl={goldenVideoUrl}
+                label={
+                  isBehaviorMode
+                    ? "Golden video — masks + behaviour labels"
+                    : "Golden video (all committed frames)"
+                }
+                height={isBehaviorMode ? 480 : 600}
+                fps={progress.fps}
+                onPlaybackFrame={isBehaviorMode ? setGoldenPlaybackFrame : null}
+              />
+            </div>
+
+            {isBehaviorMode &&
+              runId &&
+              goldenVideoUrl &&
+              progress.goldenMaxIdx !== null &&
+              progress.goldenMaxIdx !== undefined && (
+                <BehaviorTimeline
+                  runId={runId}
+                  maxFrame={progress.goldenMaxIdx}
+                  currentFrame={goldenPlaybackFrame}
+                  onSeekFrame={handleTimelineSeek}
+                  onLabelChanged={handleBehaviorLabelChanged}
+                  refreshToken={behaviorTimelineRefresh}
+                  disabled={rebuildingPreview}
+                />
+              )}
+
+            {isBehaviorMode && runId && goldenVideoUrl && (
+              <>
+                <button
+                  type="button"
+                  onClick={handleRebuildGoldenPreview}
+                  disabled={busy || rebuildingPreview || goldenPreviewInSync}
+                  style={{
+                    marginBottom: 16,
+                    padding: "10px 18px",
+                    fontSize: 14,
+                    fontWeight: 600,
+                    border: "none",
+                    borderRadius: 8,
+                    background: goldenPreviewInSync ? "#e9ecef" : "#0d6efd",
+                    color: goldenPreviewInSync ? "#6c757d" : "white",
+                    cursor: busy || rebuildingPreview || goldenPreviewInSync ? "not-allowed" : "pointer",
+                    width: "100%",
+                  }}
+                >
+                  {rebuildingPreview
+                    ? "Rebuilding golden preview…"
+                    : goldenPreviewInSync
+                      ? "Golden preview is up to date"
+                      : "Rebuild golden preview (apply labels to video)"}
+                </button>
+
+                <BehaviorLabelsReference />
+              </>
+            )}
+
+            <button
+              onClick={handleDownloadGolden}
+              disabled={busy || !runId || !goldenVideoUrl}
+              style={{
+                marginTop: 24,
+                padding: "12px 24px",
+                fontSize: 16,
+                fontWeight: 600,
+                backgroundColor: busy || !runId || !goldenVideoUrl ? "#ccc" : "#17a2b8",
+                color: "white",
+                border: "none",
+                borderRadius: 6,
+                cursor: busy || !runId || !goldenVideoUrl ? "not-allowed" : "pointer",
+                width: "100%",
+              }}
+            >
+              {busy ? "Downloading..." : "💾 Download golden folder"}
+            </button>
+          </div>
+        )}
+
+        {activeTab === "init" && (
+          <div>
+            <h2 style={{ marginTop: 0, marginBottom: 24 }}>Initialization Preview</h2>
+            {frame0Image && <Frame0Preview imageDataUrl={frame0Image} />}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
